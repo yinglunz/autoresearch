@@ -17,11 +17,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+def _load_fa3():
+    cap = torch.cuda.get_device_capability()
+    if cap[0] >= 12:  # Blackwell+: no FA3 kernel available yet
+        return None
+    try:
+        from kernels import get_kernel
+        repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+        return get_kernel(repo).flash_attn_interface
+    except Exception:
+        return None
+
+_fa3 = _load_fa3()
+
+def _sdpa_attention(q, k, v, window_size, enable_gqa):
+    Tq, Tk = q.size(2), k.size(2)
+    window = window_size[0]
+    if (window < 0 or window >= Tq) and Tq == Tk:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+    if Tq == 1:
+        if window >= 0 and window < Tk:
+            start = max(0, Tk - (window + 1))
+            k, v = k[:, :, start:, :], v[:, :, start:, :]
+        return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+    device = q.device
+    row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
+    col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+    mask = col_idx <= row_idx
+    if window >= 0 and window < Tk:
+        mask = mask & ((row_idx - col_idx) <= window)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+    """Flash Attention for training. q,k,v: (B, T, H, D)."""
+    if _fa3 is not None:
+        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    enable_gqa = q.size(1) != k.size(1)
+    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
+    return y.transpose(1, 2)
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -90,7 +124,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
